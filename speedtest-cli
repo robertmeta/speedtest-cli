@@ -347,6 +347,7 @@ def speedtest():
         for i in xrange(0, 4):
             urls.append('%s/random%sx%s.jpg' %
                         (os.path.dirname(best['url']), size, size))
+    print urls
     if not args.simple:
         print 'Testing download speed',
     dlspeed = downloadSpeed(urls, args.simple)
