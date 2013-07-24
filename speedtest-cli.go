@@ -10,16 +10,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 )
 
 const (
+	bytesPerMegabit        = 131072
+	concurrentDownloads    = 6 // not sure how the origin author picked 6
+	duplicateDownloads     = 4 // how many times do we download each image
 	configUrl              = "http://www.speedtest.net/speedtest-config.php"
 	degToRad               = math.Pi / 180
 	earthsRadiusKm         = 6371
 	helpFlag               = "help"
 	helpHelp               = "Show this help message and exit"
-	latencyPath            = "/latency.txt"
 	listFlag               = "list"
 	listHelp               = "Display a list of speedtest.net servers sorted by distance"
 	nanoSecPerMilli        = 1000000
@@ -42,6 +48,7 @@ var (
 	server string
 	// TODO: This is a hacky const-alike for the download sizes, do better
 	downloadSizes = [...]int64{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
+	wg            sync.WaitGroup
 )
 
 type Point struct {
@@ -79,8 +86,8 @@ type Server struct {
 	Long     float64 `xml:"lon,attr"`
 	Url      string  `xml:"url,attr"`
 	Host     string  `xml:"host,attr"`
-	Distance float64
-	Ping     int64
+	Distance float64 // calculated by us
+	Ping     int64   // calculated by us
 }
 
 type Servers struct {
@@ -91,6 +98,7 @@ type Servers struct {
 }
 
 func init() {
+	runtime.GOMAXPROCS(runtime.NumCPU() * 2)
 	flag.BoolVar(&help, "help", false, helpHelp)
 	flag.BoolVar(&share, "share", false, shareHelp)
 	flag.BoolVar(&simple, "simple", false, simpleHelp)
@@ -105,22 +113,29 @@ func main() {
 		os.Exit(2)
 	}
 	c := getConfig()
-	client := c.Clients[0]
+	client := getClient(c)
 	s := getClosestServers(client)
+	b := getBestServer(s)
+	mb := downloadSpeed(b)
+	fmt.Printf("Download: %0.2f Mbit/s\n", mb)
+}
+
+func getClient(c Config) Client {
+	client := c.Clients[0]
 	if simple != true {
 		fmt.Printf("Testing from %s (%s)...\n", client.Isp, client.Ip)
 	}
-	b := getBestServer(s)
-	if simple != true {
-		fmt.Printf("Hosted by %s (%s) [%f km] %d ms\n", b.Sponsor, b.Name, b.Distance, b.Ping)
-	}
+	return client
 }
 
 func getConfig() Config {
 	if simple != true {
 		fmt.Printf("Retrieving speedtest.net configuration...\n")
 	}
-	configXml, _ := fetchHttp(configUrl)
+	configXml, _, err := fetchHttp(configUrl)
+	if err != nil {
+		log.Fatal(err)
+	}
 	config := Config{}
 	xml.Unmarshal(configXml, &config)
 	return config
@@ -131,12 +146,14 @@ func getClosestServers(client Client) []Server {
 	if simple != true {
 		fmt.Printf("Retrieving speedtest.net server list ...\n")
 	}
-	serversXml, _ := fetchHttp(serversUrl)
+	serversXml, _, err := fetchHttp(serversUrl)
+	if err != nil {
+		log.Fatal(err)
+	}
 	servers := Servers{}
 	xml.Unmarshal(serversXml, &servers)
 
 	closestServers := make(map[float64]Server)
-
 	for _, server := range servers.ServerGroup[0].Servers {
 		server.Distance = distance(Point{client.Lat, client.Long}, Point{server.Lat, server.Long})
 		if len(closestServers) < 5 {
@@ -169,44 +186,112 @@ func getBestServer(servers []Server) Server {
 	}
 	firstPass := true
 	var bestServer Server
+	var bestServerLock sync.Mutex
 	for _, server := range servers {
-		u, err := url.Parse(server.Url)
-		if err != nil {
-			log.Fatal(err)
-		}
-		u.Path = latencyPath
-		totalDur := time.Since(time.Now())
-		for i := 0; i < timesToRunLatency; i++ {
-			_, dur := fetchHttp(u.String())
-			totalDur += dur
-		}
-		server.Ping = durationToMilliSeconds(totalDur) / timesToRunLatency
-		if firstPass || server.Ping < bestServer.Ping {
-			firstPass = false
-			bestServer = server
-		}
+		wg.Add(1)
+		go func(server Server) {
+			defer wg.Done()
+			u, err := url.Parse(server.Url)
+			if err != nil {
+				log.Fatal(err)
+			}
+			u.Path = "/latency.txt"
+			totalDur := time.Since(time.Now())
+			for i := 0; i < timesToRunLatency; i++ {
+				_, dur, err := fetchHttp(u.String())
+				if err != nil {
+					fmt.Printf("Failure during getBestServer: %s\n", err.Error())
+					break
+				}
+				totalDur += dur
+			}
+			server.Ping = durationToMilliSeconds(totalDur) / timesToRunLatency
+			bestServerLock.Lock()
+			if firstPass || server.Ping < bestServer.Ping {
+				firstPass = false
+				bestServer = server
+			}
+			bestServerLock.Unlock()
+		}(server)
 	}
+	wg.Wait()
 	return bestServer
+}
+
+func downloadSpeed(server Server) float64 {
+	re := regexp.MustCompile("(.*)/(.+?)$")
+	ch := make(chan string)
+	totalBytes := 0.0
+	var totalBytesLock sync.Mutex
+	if simple != true {
+		fmt.Printf("Hosted by %s (%s) [%0.2f km] %d ms\n", server.Sponsor,
+			server.Name, server.Distance, server.Ping)
+	}
+	u, err := url.Parse(server.Url)
+	if err != nil {
+		log.Fatal(err)
+	}
+	wg.Add(1)
+	go func() { // URL Generator (producer)
+		wg.Done()
+		for _, size := range downloadSizes {
+			for i := 0; i < duplicateDownloads; i++ {
+				u.Path = re.ReplaceAllString(u.Path,
+					"$1/random"+strconv.Itoa(int(size))+"x"+strconv.Itoa(int(size))+".jpg")
+				ch <- u.String()
+			}
+		}
+		close(ch)
+	}()
+
+	fmt.Printf("Testing download speed")
+	startTime := time.Now()
+	for i := 0; i < concurrentDownloads; i++ { // URL consumers
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if simple != true {
+					fmt.Printf(".")
+				}
+				url, ok := <-ch
+				if ok == false {
+					break
+				}
+				b, _, _ := fetchHttp(url)
+				totalBytesLock.Lock()
+				totalBytes += float64(len(b))
+				totalBytesLock.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("\n")
+	endTime := time.Now()
+	downloadTime := endTime.Sub(startTime)
+	bytesPerSecond := totalBytes / downloadTime.Seconds()
+	megaBitsPerSecond := bytesPerSecond / bytesPerMegabit
+	return megaBitsPerSecond
 }
 
 func durationToMilliSeconds(td time.Duration) int64 {
 	return int64(td.Nanoseconds() / nanoSecPerMilli)
 }
 
-func fetchHttp(url string) ([]byte, time.Duration) {
+func fetchHttp(url string) ([]byte, time.Duration, error) {
 	startTime := time.Now()
 	res, err := http.Get(url)
 	if err != nil {
-		log.Fatal(err)
+		return nil, time.Since(time.Now()), err
 	}
 	defer res.Body.Close()
 	body, err := ioutil.ReadAll(res.Body)
 	endTime := time.Now()
 	downloadTime := endTime.Sub(startTime)
 	if err != nil {
-		log.Fatal(err)
+		return nil, time.Since(time.Now()), err
 	}
-	return body, downloadTime
+	return body, downloadTime, nil
 }
 
 func distance(origin Point, destination Point) float64 {
