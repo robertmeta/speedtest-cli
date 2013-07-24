@@ -19,7 +19,7 @@ import (
 
 const (
 	bytesPerMegabit        = 131072
-	concurrentDownloads    = 6 // not sure how the origin author picked 6
+	concurrentDownloads    = 3 // not sure how the origin author picked 6
 	duplicateDownloads     = 4 // how many times do we download each image
 	configUrl              = "http://www.speedtest.net/speedtest-config.php"
 	degToRad               = math.Pi / 180
@@ -218,13 +218,13 @@ func getBestServer(servers []Server) Server {
 	return bestServer
 }
 
+// TODO: Fix performance of this (I think).  Currently the download rates come through 
+// lower than they should (I think).
 func downloadSpeed(server Server) float64 {
 	re := regexp.MustCompile("(.*)/(.+?)$")
 	ch := make(chan string)
 	totalBytes := 0.0
-	totalDur := time.Since(time.Now())
 	var totalBytesLock sync.Mutex
-
 	if simple != true {
 		fmt.Printf("Hosted by %s (%s) [%0.2f km] %d ms\n", server.Sponsor,
 			server.Name, server.Distance, server.Ping)
@@ -260,17 +260,18 @@ func downloadSpeed(server Server) float64 {
 				if ok == false {
 					break
 				}
-				b, d, _ := fetchHttp(url)
+				b, _, _ := fetchHttp(url)
 				totalBytesLock.Lock()
 				totalBytes += float64(len(b))
-				totalDur += d
 				totalBytesLock.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
 	fmt.Printf("\n")
-	bytesPerSecond := totalBytes / totalDur.Seconds()
+	endTime := time.Now()
+	downloadTime := endTime.Sub(startTime)
+	bytesPerSecond := totalBytes / downloadTime.Seconds()
 	megaBitsPerSecond := bytesPerSecond / bytesPerMegabit
 	return megaBitsPerSecond
 }
