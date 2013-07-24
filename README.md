@@ -6,8 +6,8 @@ Command line interface for testing internet bandwidth using speedtest.net
 ## Versions
 
 speedtest-cli is written in Go and you can choose to just get the binaries
-from the binaries directory if you want a version that will just work for 
-platform.
+from the bin directory if you want a version that will just work for 
+your platform.
 
 
 ## Usage

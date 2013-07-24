@@ -222,7 +222,9 @@ func downloadSpeed(server Server) float64 {
 	re := regexp.MustCompile("(.*)/(.+?)$")
 	ch := make(chan string)
 	totalBytes := 0.0
+	totalDur := time.Since(time.Now())
 	var totalBytesLock sync.Mutex
+
 	if simple != true {
 		fmt.Printf("Hosted by %s (%s) [%0.2f km] %d ms\n", server.Sponsor,
 			server.Name, server.Distance, server.Ping)
@@ -258,18 +260,17 @@ func downloadSpeed(server Server) float64 {
 				if ok == false {
 					break
 				}
-				b, _, _ := fetchHttp(url)
+				b, d, _ := fetchHttp(url)
 				totalBytesLock.Lock()
 				totalBytes += float64(len(b))
+				totalDur += d
 				totalBytesLock.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
 	fmt.Printf("\n")
-	endTime := time.Now()
-	downloadTime := endTime.Sub(startTime)
-	bytesPerSecond := totalBytes / downloadTime.Seconds()
+	bytesPerSecond := totalBytes / totalDur.Seconds()
 	megaBitsPerSecond := bytesPerSecond / bytesPerMegabit
 	return megaBitsPerSecond
 }
